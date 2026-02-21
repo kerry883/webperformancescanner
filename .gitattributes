@@ -1,0 +1,13 @@
+# Normalize line endings for all text files
+* text=auto
+
+# Force CSV to use LF (optional - depends on your needs)
+*.csv text eol=lf
+
+# Ensure Python files use LF
+*.py text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.gif binary
