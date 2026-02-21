@@ -1,39 +1,49 @@
 """
 reader.py — CSV URL Reader Module
 
-Reads route paths from a CSV file and combines them with a base domain
-to produce fully-qualified URLs ready for scanning.
+Reads URLs or route paths from a CSV file.
+Supports two formats:
+  - Full URLs   (e.g. https://example.com/about)  → used as-is
+  - Route paths (e.g. /about)                     → base domain prepended
 """
 
 import csv
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
+from urllib.parse import urlparse
 
 from rich.console import Console
 
 console = Console()
 
 
-def read_routes(csv_path: str = "urls.csv") -> List[str]:
-    """
-    Read route paths from a single-column CSV file.
+def _is_full_url(value: str) -> bool:
+    """Return True if *value* looks like a complete URL (has a scheme)."""
+    parsed = urlparse(value)
+    return parsed.scheme in ("http", "https")
 
-    The CSV file is expected to have a header row (ignored) and one route
-    per subsequent row, e.g.:
-        route
-        /
-        /about
-        /pricing
+
+def read_urls(csv_path: str = "urls.csv") -> Tuple[List[str], List[str]]:
+    """
+    Read entries from a single-column CSV file.
+
+    Each row can be either:
+      • A full URL  (https://…)  — collected into the *full_urls* list.
+      • A route path (/about)    — collected into the *routes* list.
+
+    The CSV must have a header row (skipped automatically).
 
     Args:
-        csv_path: Path to the CSV file containing route paths.
+        csv_path: Path to the CSV file.
 
     Returns:
-        A list of route path strings (e.g. ["/", "/about", "/pricing"]).
+        A tuple of (full_urls, routes) where:
+          - full_urls: URLs that are already fully qualified.
+          - routes:    Bare paths that still need a base domain.
 
     Raises:
-        SystemExit: If the file is not found or cannot be read.
+        SystemExit: If the file is missing, unreadable, or empty.
     """
     path = Path(csv_path)
 
@@ -43,10 +53,11 @@ def read_routes(csv_path: str = "urls.csv") -> List[str]:
             f"[bold red]Error:[/bold red] CSV file not found: '{csv_path}'"
         )
         console.print(
-            "Please create a 'urls.csv' file with one route per line."
+            "Please create a 'urls.csv' file with one URL or route per line."
         )
         sys.exit(1)
 
+    full_urls: List[str] = []
     routes: List[str] = []
 
     try:
@@ -59,18 +70,21 @@ def read_routes(csv_path: str = "urls.csv") -> List[str]:
                 if not row or not row[0].strip():
                     continue
 
-                route = row[0].strip()
+                entry = row[0].strip()
 
-                # Basic validation: routes should start with /
-                if not route.startswith("/"):
-                    console.print(
-                        f"[yellow]Warning:[/yellow] Row {row_number} "
-                        f"route '{route}' does not start with '/'. "
-                        "Prepending '/' automatically."
-                    )
-                    route = "/" + route
-
-                routes.append(route)
+                if _is_full_url(entry):
+                    # Already a complete URL — use as-is
+                    full_urls.append(entry)
+                else:
+                    # Treat as a route path; ensure it starts with /
+                    if not entry.startswith("/"):
+                        console.print(
+                            f"[yellow]Warning:[/yellow] Row {row_number} "
+                            f"route '{entry}' does not start with '/'. "
+                            "Prepending '/' automatically."
+                        )
+                        entry = "/" + entry
+                    routes.append(entry)
 
     except csv.Error as exc:
         console.print(
@@ -83,17 +97,26 @@ def read_routes(csv_path: str = "urls.csv") -> List[str]:
         )
         sys.exit(1)
 
-    if not routes:
+    total = len(full_urls) + len(routes)
+    if total == 0:
         console.print(
-            f"[bold red]Error:[/bold red] No valid routes found in '{csv_path}'."
+            f"[bold red]Error:[/bold red] No valid entries found in '{csv_path}'."
         )
         sys.exit(1)
 
-    console.print(
-        f"[green]✓[/green] Loaded [bold]{len(routes)}[/bold] route(s) "
-        f"from '{csv_path}'."
-    )
-    return routes
+    # Summary
+    if full_urls:
+        console.print(
+            f"[green]✓[/green] Loaded [bold]{len(full_urls)}[/bold] full URL(s) "
+            f"from '{csv_path}'."
+        )
+    if routes:
+        console.print(
+            f"[green]✓[/green] Loaded [bold]{len(routes)}[/bold] route path(s) "
+            f"from '{csv_path}' (base domain will be prepended)."
+        )
+
+    return full_urls, routes
 
 
 def build_full_urls(base_url: str, routes: List[str]) -> List[str]:

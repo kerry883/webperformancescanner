@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 
-from reader import build_full_urls, read_routes
+from reader import build_full_urls, read_urls
 from reporter import build_dataframe, compute_averages, export_csv, print_results_table
 from scanner import scan_urls
 
@@ -102,14 +102,8 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # ── 3. Resolve base URL ─────────────────────────────────────────────
+    # ── 3. Resolve base URL (may be optional if CSV has full URLs) ────
     base_url = args.base_url or os.getenv("BASE_URL")
-    if not base_url or base_url == "https://example.com":
-        console.print(
-            "[bold red]Error:[/bold red] No base URL configured.\n"
-            "Pass [bold]--base-url[/bold] or set BASE_URL in .env."
-        )
-        sys.exit(1)
 
     # ── 4. Resolve request delay ────────────────────────────────────────
     if args.delay is not None:
@@ -120,11 +114,31 @@ def main() -> None:
         except ValueError:
             delay = 2.0
 
-    # ── 5. Read routes from CSV ─────────────────────────────────────────
-    routes = read_routes(args.csv)
-    full_urls = build_full_urls(base_url, routes)
+    # ── 5. Read URLs / routes from CSV ──────────────────────────────────
+    csv_full_urls, routes = read_urls(args.csv)
 
-    console.print(f"[bold]Base URL:[/bold] {base_url}")
+    # Build full URLs from route paths (needs a base domain)
+    if routes:
+        if not base_url or base_url == "https://example.com":
+            console.print(
+                "[bold red]Error:[/bold red] CSV contains route paths that "
+                "need a base URL, but none is configured.\n"
+                "Pass [bold]--base-url[/bold] or set BASE_URL in .env."
+            )
+            sys.exit(1)
+        csv_full_urls.extend(build_full_urls(base_url, routes))
+
+    # Deduplicate while preserving order
+    seen = set()
+    full_urls = []
+    for url in csv_full_urls:
+        if url not in seen:
+            seen.add(url)
+            full_urls.append(url)
+
+    if base_url and base_url != "https://example.com":
+        console.print(f"[bold]Base URL:[/bold] {base_url}")
+    console.print(f"[bold]URLs:[/bold]     {len(full_urls)} unique target(s)")
     console.print(f"[bold]Delay:[/bold]    {delay}s between requests")
     console.print(f"[bold]Output:[/bold]   {args.output}")
 
