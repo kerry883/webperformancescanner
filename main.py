@@ -1,0 +1,154 @@
+"""
+main.py — CLI Entry Point & Orchestrator
+
+Ties together the reader, scanner, and reporter modules to run a
+full PageSpeed Insights scan from the command line.
+
+Usage:
+    python main.py                          # uses BASE_URL from .env
+    python main.py --base-url https://example.com
+    python main.py --csv routes.csv --delay 3
+"""
+
+import argparse
+import os
+import sys
+
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.panel import Panel
+
+from reader import build_full_urls, read_routes
+from reporter import build_dataframe, compute_averages, export_csv, print_results_table
+from scanner import scan_urls
+
+console = Console()
+
+
+def _load_env() -> None:
+    """Load environment variables from the .env file."""
+    load_dotenv()
+
+
+def _parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    Returns:
+        Namespace with base_url, csv, delay, and output attributes.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Scan website routes with the Google PageSpeed Insights API "
+            "and report average performance metrics."
+        ),
+    )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help=(
+            "Base domain to prepend to routes "
+            "(e.g. https://example.com). "
+            "Defaults to BASE_URL in .env."
+        ),
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default="urls.csv",
+        help="Path to the CSV file containing routes (default: urls.csv).",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=None,
+        help=(
+            "Seconds to wait between API requests (default: 2). "
+            "Overrides REQUEST_DELAY in .env."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="results.csv",
+        help="Path for the exported results CSV (default: results.csv).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Main orchestration function."""
+
+    # ── 1. Load environment & CLI args ──────────────────────────────────
+    _load_env()
+    args = _parse_args()
+
+    console.print(
+        Panel(
+            "[bold cyan]Web Performance Scanner[/bold cyan]\n"
+            "Google PageSpeed Insights — Batch Route Analyser",
+            border_style="cyan",
+        )
+    )
+
+    # ── 2. Resolve API key ──────────────────────────────────────────────
+    api_key = os.getenv("API_KEY")
+    if not api_key or api_key == "your_api_key_here":
+        console.print(
+            "[bold red]Error:[/bold red] No valid API_KEY found.\n"
+            "Set your Google PageSpeed Insights API key in the "
+            "[bold].env[/bold] file."
+        )
+        sys.exit(1)
+
+    # ── 3. Resolve base URL ─────────────────────────────────────────────
+    base_url = args.base_url or os.getenv("BASE_URL")
+    if not base_url or base_url == "https://example.com":
+        console.print(
+            "[bold red]Error:[/bold red] No base URL configured.\n"
+            "Pass [bold]--base-url[/bold] or set BASE_URL in .env."
+        )
+        sys.exit(1)
+
+    # ── 4. Resolve request delay ────────────────────────────────────────
+    if args.delay is not None:
+        delay = args.delay
+    else:
+        try:
+            delay = float(os.getenv("REQUEST_DELAY", "2"))
+        except ValueError:
+            delay = 2.0
+
+    # ── 5. Read routes from CSV ─────────────────────────────────────────
+    routes = read_routes(args.csv)
+    full_urls = build_full_urls(base_url, routes)
+
+    console.print(f"[bold]Base URL:[/bold] {base_url}")
+    console.print(f"[bold]Delay:[/bold]    {delay}s between requests")
+    console.print(f"[bold]Output:[/bold]   {args.output}")
+
+    # ── 6. Scan URLs via API ────────────────────────────────────────────
+    results = scan_urls(full_urls, api_key, delay=delay)
+
+    if not results:
+        console.print(
+            "[bold red]Error:[/bold red] No results were returned. "
+            "Check your API key and network connection."
+        )
+        sys.exit(1)
+
+    # ── 7. Aggregate & display ──────────────────────────────────────────
+    df = build_dataframe(results)
+    averages = compute_averages(df)
+    print_results_table(df, averages)
+
+    # ── 8. Export CSV ───────────────────────────────────────────────────
+    export_csv(df, averages, output_path=args.output)
+
+    console.print()
+    console.print("[bold green]Done![/bold green] 🎉")
+
+
+if __name__ == "__main__":
+    main()

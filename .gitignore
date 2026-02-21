@@ -1,0 +1,17 @@
+# Virtual environment
+venv/
+
+# Environment variables (contains API key)
+.env
+
+# Scan output
+results.csv
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.vscode/
+.idea/
