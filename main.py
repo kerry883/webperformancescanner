@@ -74,6 +74,16 @@ def _parse_args() -> argparse.Namespace:
         default="results.csv",
         help="Path for the exported results CSV (default: results.csv).",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help=(
+            "Number of concurrent threads / 'channels' for parallel "
+            "API calls (default: 10). Increase for more speed, "
+            "decrease if you hit rate-limit errors."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -137,13 +147,15 @@ def main() -> None:
             full_urls.append(url)
 
     if base_url and base_url != "https://example.com":
-        console.print(f"[bold]Base URL:[/bold] {base_url}")
-    console.print(f"[bold]URLs:[/bold]     {len(full_urls)} unique target(s)")
-    console.print(f"[bold]Delay:[/bold]    {delay}s between requests")
-    console.print(f"[bold]Output:[/bold]   {args.output}")
+        console.print(f"[bold]Base URL:[/bold]  {base_url}")
+    console.print(f"[bold]URLs:[/bold]      {len(full_urls)} unique target(s)")
+    console.print(f"[bold]Workers:[/bold]   {args.workers} concurrent threads")
+    console.print(f"[bold]Output:[/bold]    {args.output}")
 
-    # ── 6. Scan URLs via API ────────────────────────────────────────────
-    results = scan_urls(full_urls, api_key, delay=delay)
+    # ── 6. Scan URLs via API (concurrent) ───────────────────────────────
+    results = scan_urls(
+        full_urls, api_key, delay=delay, max_workers=args.workers
+    )
 
     if not results:
         console.print(
