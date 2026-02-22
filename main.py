@@ -19,7 +19,12 @@ from rich.console import Console
 from rich.panel import Panel
 
 from reader import build_full_urls, read_urls
-from reporter import build_dataframe, compute_averages, export_csv, print_results_table
+from reporter import (
+    build_dataframe,
+    compute_averages_by_strategy,
+    export_csv,
+    print_full_report,
+)
 from scanner import scan_urls
 
 console = Console()
@@ -164,10 +169,10 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # ── 7. Aggregate & display ──────────────────────────────────────────
+    # ── 7. Aggregate & display comprehensive report ──────────────────
     df = build_dataframe(results)
-    averages = compute_averages(df)
-    print_results_table(df, averages)
+    averages = compute_averages_by_strategy(df)
+    print_full_report(df, averages)
 
     # ── 8. Export CSV ───────────────────────────────────────────────────
     export_csv(df, averages, output_path=args.output)

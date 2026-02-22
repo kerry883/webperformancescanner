@@ -2,8 +2,12 @@
 scanner.py — PageSpeed Insights API Scanner Module (Concurrent)
 
 Handles all interactions with the Google PageSpeed Insights V5 API.
-For each URL it runs both 'mobile' and 'desktop' strategies and extracts
-scores for Performance, Accessibility, Best Practices, and SEO.
+For each URL it runs both 'mobile' and 'desktop' strategies and extracts:
+  • Category scores   (Performance, Accessibility, Best Practices, SEO)
+  • Lab metrics       (FCP, LCP, CLS, TBT, Speed Index, TTI)
+  • Field / CrUX data (FCP, LCP, CLS, INP, TTFB — when available)
+  • Top opportunities (recommendations with estimated savings)
+  • Diagnostics       (informational audits)
 
 Uses concurrent.futures.ThreadPoolExecutor so that many API calls run
 in parallel ("each URL on its own channel"), dramatically reducing the
@@ -36,6 +40,30 @@ CATEGORIES = ["performance", "accessibility", "best-practices", "seo"]
 # Strategies to test for each URL
 STRATEGIES = ["mobile", "desktop"]
 
+# Lab metric audit IDs → human-readable names
+LAB_METRIC_IDS = {
+    "first-contentful-paint": "FCP",
+    "largest-contentful-paint": "LCP",
+    "cumulative-layout-shift": "CLS",
+    "total-blocking-time": "TBT",
+    "speed-index": "Speed Index",
+    "interactive": "TTI",
+}
+
+# CrUX field metric keys → human-readable names
+FIELD_METRIC_KEYS = {
+    "FIRST_CONTENTFUL_PAINT_MS": "FCP",
+    "LARGEST_CONTENTFUL_PAINT_MS": "LCP",
+    "CUMULATIVE_LAYOUT_SHIFT_SCORE": "CLS",
+    "INTERACTION_TO_NEXT_PAINT": "INP",
+    "EXPERIMENTAL_TIME_TO_FIRST_BYTE": "TTFB",
+    "FIRST_INPUT_DELAY_MS": "FID",
+}
+
+# Maximum number of opportunities / diagnostics to extract per scan
+MAX_OPPORTUNITIES = 10
+MAX_DIAGNOSTICS = 5
+
 # Thread-safe lock for appending results
 _results_lock = threading.Lock()
 
@@ -58,7 +86,7 @@ def _fetch_pagespeed(
         "url": url,
         "key": api_key,
         "strategy": strategy,
-        "category": CATEGORIES,  # requests encodes list params correctly
+        "category": CATEGORIES,
     }
 
     try:
@@ -89,17 +117,14 @@ def _fetch_pagespeed(
     return None
 
 
-def _extract_scores(data: Dict[str, Any]) -> Dict[str, Optional[int]]:
+# ── Extraction helpers ──────────────────────────────────────────────────────
+
+
+def _extract_category_scores(
+    data: Dict[str, Any],
+) -> Dict[str, Optional[int]]:
     """
-    Extract category scores from a PageSpeed Insights API response.
-
-    Scores are returned as floats 0–1 by the API; we convert to 0–100.
-
-    Args:
-        data: The full JSON response from the API.
-
-    Returns:
-        A dict mapping category names to integer scores (or None if missing).
+    Extract the four Lighthouse category scores (0–100).
     """
     scores: Dict[str, Optional[int]] = {}
     categories = data.get("lighthouseResult", {}).get("categories", {})
@@ -114,36 +139,207 @@ def _extract_scores(data: Dict[str, Any]) -> Dict[str, Optional[int]]:
     return scores
 
 
+def _extract_lab_metrics(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract Core Web Vitals and other lab metrics from Lighthouse audits.
+
+    Returns a dict like:
+        {"lab_FCP": "1.8 s", "lab_FCP_ms": 1800, "lab_LCP": "2.5 s", ...}
+    """
+    audits = data.get("lighthouseResult", {}).get("audits", {})
+    metrics: Dict[str, Any] = {}
+
+    for audit_id, label in LAB_METRIC_IDS.items():
+        audit = audits.get(audit_id, {})
+        # displayValue is the human-readable string ("1.8 s", "0.12")
+        metrics[f"lab_{label}"] = audit.get("displayValue")
+        # numericValue is the raw number (ms or unitless for CLS)
+        metrics[f"lab_{label}_value"] = audit.get("numericValue")
+        # score 0–1 for colour coding
+        score = audit.get("score")
+        metrics[f"lab_{label}_score"] = (
+            int(score * 100) if score is not None else None
+        )
+
+    return metrics
+
+
+def _extract_field_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract Chrome User Experience Report (CrUX) field data from the
+    ``loadingExperience`` section of the API response.
+
+    Returns a dict like:
+        {"field_overall": "SLOW", "field_FCP": "1,200 ms",
+         "field_FCP_category": "FAST", "field_FCP_percentile": 1200, ...}
+    """
+    loading_exp = data.get("loadingExperience", {})
+    field: Dict[str, Any] = {}
+
+    # Overall field category (FAST / AVERAGE / SLOW / NONE)
+    field["field_overall"] = loading_exp.get("overall_category")
+
+    # Origin-level flag
+    field["field_origin_fallback"] = loading_exp.get(
+        "origin_fallback", False
+    )
+
+    metrics = loading_exp.get("metrics", {})
+
+    for api_key_name, label in FIELD_METRIC_KEYS.items():
+        metric = metrics.get(api_key_name, {})
+        if metric:
+            field[f"field_{label}_category"] = metric.get("category")
+            field[f"field_{label}_percentile"] = metric.get("percentile")
+
+            # Build distributions (GOOD / NEEDS_IMPROVEMENT / POOR %)
+            distributions = metric.get("distributions", [])
+            if distributions and len(distributions) == 3:
+                field[f"field_{label}_good"] = round(
+                    distributions[0].get("proportion", 0) * 100, 1
+                )
+                field[f"field_{label}_needs_improvement"] = round(
+                    distributions[1].get("proportion", 0) * 100, 1
+                )
+                field[f"field_{label}_poor"] = round(
+                    distributions[2].get("proportion", 0) * 100, 1
+                )
+        else:
+            field[f"field_{label}_category"] = None
+            field[f"field_{label}_percentile"] = None
+
+    return field
+
+
+def _extract_opportunities(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Extract the top Lighthouse opportunities (performance suggestions
+    with estimated savings).
+
+    Returns a list of dicts sorted by potential savings (descending):
+        [{"id": "...", "title": "...", "savings_ms": 1200,
+          "savings_display": "1.2 s", "description": "..."}, ...]
+    """
+    audits = data.get("lighthouseResult", {}).get("audits", {})
+    perf_cat = (
+        data.get("lighthouseResult", {})
+        .get("categories", {})
+        .get("performance", {})
+    )
+    audit_refs = perf_cat.get("auditRefs", [])
+
+    # Collect opportunity-type audits that have overallSavingsMs
+    opportunities: List[Dict[str, Any]] = []
+    for ref in audit_refs:
+        if ref.get("group") != "opportunity":
+            continue
+        audit_id = ref.get("id", "")
+        audit = audits.get(audit_id, {})
+        # Skip audits that already pass (score == 1)
+        if audit.get("score") == 1:
+            continue
+
+        savings_ms = (
+            audit.get("details", {}).get("overallSavingsMs")
+            or audit.get("numericValue")
+        )
+
+        opportunities.append(
+            {
+                "id": audit_id,
+                "title": audit.get("title", audit_id),
+                "description": audit.get("description", ""),
+                "savings_ms": savings_ms if savings_ms else 0,
+                "display_value": audit.get("displayValue", ""),
+                "score": audit.get("score"),
+            }
+        )
+
+    # Sort by biggest savings first, take top N
+    opportunities.sort(key=lambda o: o.get("savings_ms", 0), reverse=True)
+    return opportunities[:MAX_OPPORTUNITIES]
+
+
+def _extract_diagnostics(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Extract top Lighthouse diagnostics (informational audits that
+    highlight issues but don't have a direct savings estimate).
+
+    Returns a list of dicts:
+        [{"id": "...", "title": "...", "display_value": "...",
+          "description": "..."}, ...]
+    """
+    audits = data.get("lighthouseResult", {}).get("audits", {})
+    perf_cat = (
+        data.get("lighthouseResult", {})
+        .get("categories", {})
+        .get("performance", {})
+    )
+    audit_refs = perf_cat.get("auditRefs", [])
+
+    diagnostics: List[Dict[str, Any]] = []
+    for ref in audit_refs:
+        if ref.get("group") != "diagnostics":
+            continue
+        audit_id = ref.get("id", "")
+        audit = audits.get(audit_id, {})
+        if audit.get("score") == 1:
+            continue
+
+        diagnostics.append(
+            {
+                "id": audit_id,
+                "title": audit.get("title", audit_id),
+                "description": audit.get("description", ""),
+                "display_value": audit.get("displayValue", ""),
+                "score": audit.get("score"),
+            }
+        )
+
+    return diagnostics[:MAX_DIAGNOSTICS]
+
+
+# ── Scan functions ──────────────────────────────────────────────────────────
+
+
 def _scan_single(
     url: str, strategy: str, api_key: str
 ) -> Dict[str, Any]:
     """
-    Scan a single URL + strategy combination.
+    Scan a single URL + strategy combination and extract full data.
 
     This is the unit of work submitted to the thread pool.
-
-    Args:
-        url:      Fully-qualified URL.
-        strategy: 'mobile' or 'desktop'.
-        api_key:  Google API key.
-
-    Returns:
-        A result dict with url, strategy, and the four category scores.
     """
     data = _fetch_pagespeed(url, strategy, api_key)
 
-    if data is not None:
-        scores = _extract_scores(data)
-        return {"url": url, "strategy": strategy, **scores}
+    if data is None:
+        return {
+            "url": url,
+            "strategy": strategy,
+            "performance": None,
+            "accessibility": None,
+            "best-practices": None,
+            "seo": None,
+            "lab_metrics": {},
+            "field_data": {},
+            "opportunities": [],
+            "diagnostics": [],
+        }
 
-    # Record the attempt with None scores so we know it failed
+    scores = _extract_category_scores(data)
+    lab = _extract_lab_metrics(data)
+    field = _extract_field_data(data)
+    opps = _extract_opportunities(data)
+    diags = _extract_diagnostics(data)
+
     return {
         "url": url,
         "strategy": strategy,
-        "performance": None,
-        "accessibility": None,
-        "best-practices": None,
-        "seo": None,
+        **scores,
+        "lab_metrics": lab,
+        "field_data": field,
+        "opportunities": opps,
+        "diagnostics": diags,
     }
 
 
@@ -166,17 +362,11 @@ def scan_urls(
         delay:       Kept for interface compatibility (ignored in
                      concurrent mode — parallelism handles throughput).
         max_workers: Number of concurrent threads / "channels"
-                     (default 10). Increase for more speed, decrease
-                     if you hit API rate-limit errors.
+                     (default 10).
 
     Returns:
-        A list of result dicts, each containing:
-            - url (str)
-            - strategy (str)
-            - performance (int | None)
-            - accessibility (int | None)
-            - best-practices (int | None)
-            - seo (int | None)
+        A list of result dicts with scores, lab metrics, field data,
+        opportunities, and diagnostics.
     """
     results: List[Dict[str, Any]] = []
     total_requests = len(urls) * len(STRATEGIES)
@@ -211,7 +401,6 @@ def scan_urls(
             "[cyan]Scanning in parallel…[/cyan]", total=total_requests
         )
 
-        # Submit all jobs to the thread pool
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_job = {
                 executor.submit(_scan_single, url, strategy, api_key): (
@@ -221,13 +410,11 @@ def scan_urls(
                 for url, strategy in jobs
             }
 
-            # Collect results as they complete
             for future in as_completed(future_to_job):
                 url, strategy = future_to_job[future]
                 try:
                     result = future.result()
                 except Exception as exc:
-                    # Catch any unexpected exception from the thread
                     console.print(
                         f"  [red]Unexpected error[/red] for {url} "
                         f"({strategy}): {exc}"
@@ -239,12 +426,15 @@ def scan_urls(
                         "accessibility": None,
                         "best-practices": None,
                         "seo": None,
+                        "lab_metrics": {},
+                        "field_data": {},
+                        "opportunities": [],
+                        "diagnostics": [],
                     }
 
                 with _results_lock:
                     results.append(result)
 
-                # Update progress bar with the latest completed job
                 progress.update(
                     task,
                     description=(
@@ -254,7 +444,7 @@ def scan_urls(
                 )
                 progress.advance(task)
 
-    # Sort results by original URL order, then strategy, for clean output
+    # Sort results by original URL order, then strategy
     url_order = {url: idx for idx, url in enumerate(urls)}
     strategy_order = {s: idx for idx, s in enumerate(STRATEGIES)}
     results.sort(
@@ -266,9 +456,7 @@ def scan_urls(
 
     console.print()
     success_count = sum(
-        1
-        for r in results
-        if r["performance"] is not None
+        1 for r in results if r["performance"] is not None
     )
     console.print(
         f"[green]✓[/green] Completed: "

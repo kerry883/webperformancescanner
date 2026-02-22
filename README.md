@@ -1,6 +1,6 @@
 # Web Performance Scanner
 
-A modular Python CLI tool that batch-scans website routes using the **Google PageSpeed Insights API** and produces colour-coded performance reports with averaged metrics.
+A modular Python CLI tool that batch-scans website URLs using the **Google PageSpeed Insights API** and produces a **comprehensive, multi-section performance report** with lab metrics, field data (CrUX), recommendations, and actionable improvement suggestions.
 
 ---
 
@@ -19,7 +19,7 @@ A modular Python CLI tool that batch-scans website routes using the **Google Pag
   - [CLI Arguments](#cli-arguments)
   - [Examples](#examples)
 - [Output](#output)
-  - [Terminal Table](#terminal-table)
+  - [Report Sections](#report-sections)
   - [CSV Export](#csv-export)
   - [Score Colour Coding](#score-colour-coding)
 - [Module Reference](#module-reference)
@@ -37,15 +37,31 @@ A modular Python CLI tool that batch-scans website routes using the **Google Pag
 
 ## Features
 
+### Scanning
+
 - **Batch scanning** — Analyse hundreds of URLs in a single run.
 - **Concurrent API calls** — Uses a thread pool (`ThreadPoolExecutor`) so every URL gets its own "channel"; scans that previously took ~2 hours now finish in ~10–15 minutes.
 - **Dual strategy** — Every URL is tested for both **mobile** and **desktop**.
-- **Four Lighthouse categories** — Performance, Accessibility, Best Practices, and SEO.
 - **Flexible input** — The CSV file accepts full URLs (`https://…`) *or* bare route paths (`/about`) that are combined with a configurable base domain.
 - **Automatic deduplication** — Duplicate URLs are removed before scanning.
-- **Colour-coded terminal output** — Powered by [Rich](https://github.com/Textualize/rich); scores are green (≥ 90), yellow (50–89), or red (< 50).
-- **Averages row** — Overall averages are computed with [pandas](https://pandas.pydata.org/) and displayed at the bottom of the table.
-- **CSV export** — Full results (individual + averages) are written to `results.csv`.
+
+### Data Extraction
+
+- **Four Lighthouse categories** — Performance, Accessibility, Best Practices, and SEO scores (0–100).
+- **Lab metrics** — First Contentful Paint (FCP), Largest Contentful Paint (LCP), Cumulative Layout Shift (CLS), Total Blocking Time (TBT), Speed Index, and Time to Interactive (TTI) with display values, raw values, and individual scores.
+- **Field / CrUX data** — Real-user metrics from the Chrome User Experience Report: FCP, LCP, CLS, INP, TTFB, and FID with percentile values, category ratings (FAST/AVERAGE/SLOW), and distribution percentages.
+- **Opportunities** — Top 10 recommendations with estimated time savings (ms) per URL.
+- **Diagnostics** — Top 5 informational audit findings per URL.
+
+### Reporting
+
+- **6-section terminal report** — Comprehensive colour-coded output powered by [Rich](https://github.com/Textualize/rich).
+- **Separate mobile & desktop averages** — Average scores calculated independently for each strategy, plus overall averages, with performance ratings (Excellent/Good/Needs Improvement/Poor).
+- **Lab metrics table** — Core Web Vitals displayed with display values, raw values, and colour-coded scores per URL.
+- **Field data table** — CrUX real-user metrics with percentile values, categories, and distribution breakdowns (Good/Needs Improvement/Poor %).
+- **Recommendations panel** — Aggregated opportunities ranked by frequency and average savings; most common diagnostics listed.
+- **Actionable improvement summary** — Auto-generated priority areas, worst-performing routes, category-specific suggestions, lab-metric suggestions, and mobile-vs-desktop gap analysis.
+- **CSV export** — Full results with flattened lab metrics, field data, top opportunity, and 3 average rows (mobile/desktop/overall).
 - **Secure configuration** — API key loaded from a `.env` file via `python-dotenv`.
 - **Graceful error handling** — File-not-found, HTTP errors, timeouts, and malformed API responses are all caught and reported cleanly.
 
@@ -54,30 +70,40 @@ A modular Python CLI tool that batch-scans website routes using the **Google Pag
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                       main.py                           │
-│              CLI entry point & orchestrator              │
-│  Loads .env → Parses args → Coordinates modules below   │
-└────────┬──────────────┬──────────────────┬──────────────┘
-         │              │                  │
-         ▼              ▼                  ▼
-   ┌──────────┐  ┌─────────────┐   ┌─────────────┐
-   │ reader.py│  │ scanner.py  │   │ reporter.py │
-   │          │  │             │   │             │
-   │ CSV      │  │ PageSpeed   │   │ pandas      │
-   │ parsing  │  │ API calls   │   │ aggregation │
-   │ & URL    │  │ (concurrent │   │ + Rich      │
-   │ building │  │  threads)   │   │ table +     │
-   │          │  │             │   │ CSV export  │
-   └──────────┘  └─────────────┘   └─────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                            main.py                                   │
+│                  CLI entry point & orchestrator                       │
+│     Loads .env → Parses args → Coordinates modules below             │
+└──────┬──────────────────┬──────────────────────┬─────────────────────┘
+       │                  │                      │
+       ▼                  ▼                      ▼
+ ┌───────────┐   ┌───────────────┐       ┌──────────────┐
+ │ reader.py │   │  scanner.py   │       │ reporter.py  │
+ │           │   │               │       │              │
+ │ CSV       │   │ PageSpeed API │       │ 6-section    │
+ │ parsing   │   │ (concurrent   │       │ terminal     │
+ │ & URL     │   │  threads)     │       │ report:      │
+ │ building  │   │               │       │  • Scores    │
+ │           │   │ Extracts:     │       │  • Averages  │
+ │           │   │  • Scores     │       │  • Lab data  │
+ │           │   │  • Lab data   │       │  • Field data│
+ │           │   │  • Field data │       │  • Recs      │
+ │           │   │  • Opps       │       │  • Summary   │
+ │           │   │  • Diagnostics│       │ + CSV export │
+ └───────────┘   └───────────────┘       └──────────────┘
 ```
 
 **Data flow:**
 
 1. `reader.py` reads `urls.csv` and separates full URLs from route paths.
 2. Route paths are combined with the base domain to produce full URLs.
-3. `scanner.py` dispatches all URL × strategy combinations to a thread pool and collects Lighthouse scores.
-4. `reporter.py` aggregates the results, prints a colour-coded table, and exports to CSV.
+3. `scanner.py` dispatches all URL × strategy combinations to a thread pool and collects:
+   - 4 Lighthouse category scores
+   - 6 lab metrics (FCP, LCP, CLS, TBT, Speed Index, TTI)
+   - CrUX field data (FCP, LCP, CLS, INP, TTFB, FID)
+   - Top 10 opportunities with estimated savings
+   - Top 5 diagnostics
+4. `reporter.py` builds a DataFrame, computes separate mobile/desktop/overall averages, prints a 6-section colour-coded report, and exports everything to CSV.
 
 ---
 
@@ -254,9 +280,13 @@ python main.py --base-url https://mysite.com --csv routes.csv --workers 15 --out
 
 ## Output
 
-### Terminal Table
+### Report Sections
 
-The scanner prints a colour-coded table using the Rich library:
+The scanner produces a **6-section terminal report** using the Rich library. Each section is displayed as a colour-coded table or panel.
+
+#### Section 1 — Category Scores
+
+Individual Lighthouse scores for each URL × strategy:
 
 ```
 ┌──────────────────────────────────┬──────────┬─────────────┬───────────────┬────────────────┬─────┐
@@ -266,22 +296,79 @@ The scanner prints a colour-coded table using the Rich library:
 │ https://example.com/             │ Desktop  │     78      │      92       │       87       │  91 │
 │ https://example.com/about        │ Mobile   │     62      │      95       │       91       │  89 │
 │ https://example.com/about        │ Desktop  │     91      │      95       │       91       │  89 │
-├──────────────────────────────────┼──────────┼─────────────┼───────────────┼────────────────┼─────┤
-│ AVERAGE                          │   ALL    │    69.0     │     93.5      │      89.0      │90.0 │
 └──────────────────────────────────┴──────────┴─────────────┴───────────────┴────────────────┴─────┘
 ```
 
+#### Section 2 — Strategy Averages
+
+Three separate tables showing average scores for **Mobile**, **Desktop**, and **Overall**, with performance ratings:
+
+```
+📱 MOBILE Averages                          🖥️ DESKTOP Averages
+┌─────────────┬───────┬────────┐            ┌─────────────┬───────┬────────┐
+│ Category    │ Score │ Rating │            │ Category    │ Score │ Rating │
+├─────────────┼───────┼────────┤            ├─────────────┼───────┼────────┤
+│ Performance │ 53.5  │ Needs… │            │ Performance │ 84.5  │ Good   │
+│ Accessib.   │ 93.5  │ Excel. │            │ Accessib.   │ 93.5  │ Excel. │
+│ Best Pract. │ 89.0  │ Good   │            │ Best Pract. │ 89.0  │ Good   │
+│ SEO         │ 90.0  │ Excel. │            │ SEO         │ 90.0  │ Excel. │
+└─────────────┴───────┴────────┘            └─────────────┴───────┴────────┘
+
+🌐 OVERALL Averages
+┌─────────────┬───────┬────────┐
+│ Category    │ Score │ Rating │
+├─────────────┼───────┼────────┤
+│ Performance │ 69.0  │ Needs… │
+│ ...         │ ...   │ ...    │
+└─────────────┴───────┴────────┘
+```
+
+Ratings: **Excellent** (≥ 90), **Good** (≥ 75), **Needs Improvement** (≥ 50), **Poor** (< 50).
+
+#### Section 3 — Lab Metrics (Core Web Vitals)
+
+Detailed lab data for each URL showing display values, raw values, and individual scores:
+
+| URL | Strategy | FCP (display) | FCP (raw) | FCP (score) | LCP | CLS | TBT | SI | TTI |
+|-----|----------|---------------|-----------|-------------|-----|-----|-----|----|-----|
+
+#### Section 4 — Field Data (CrUX)
+
+Real-user metrics from the Chrome User Experience Report (when available):
+
+| URL | Strategy | FCP (p75) | FCP (cat) | FCP (good/avg/poor %) | LCP | CLS | INP | TTFB | FID |
+|-----|----------|-----------|-----------|------------------------|-----|-----|-----|------|-----|
+
+> **Note:** Field data is only available for URLs with enough real-user traffic in the CrUX dataset.
+
+#### Section 5 — Recommendations
+
+Aggregated opportunities and diagnostics across all scanned URLs:
+
+- **Top Opportunities** — Ranked by frequency (how many URLs share the same recommendation) and average estimated savings in milliseconds.
+- **Common Diagnostics** — Most frequently appearing informational audit findings.
+
+#### Section 6 — Actionable Improvement Summary
+
+Auto-generated panel with:
+
+- **Priority areas** — Categories scoring below 75 that need attention.
+- **Worst-performing routes** — Bottom 5 URLs by Performance score.
+- **Category-specific suggestions** — Tailored tips for Performance, Accessibility, Best Practices, and SEO based on actual scores.
+- **Lab-metric suggestions** — Specific advice based on FCP, LCP, CLS, TBT, and TTI values.
+- **Mobile vs Desktop gap analysis** — Shows score differences and calls out mobile-specific issues when the gap is > 10 points.
+
 ### CSV Export
 
-The `results.csv` file contains all individual results plus an `AVERAGE` row:
+The `results.csv` file contains all individual results with flattened lab metrics, field data, and top opportunity, plus **3 average rows** (mobile, desktop, overall):
 
 ```csv
-url,strategy,performance,accessibility,best-practices,seo
-https://example.com/,mobile,45,92,87,91
-https://example.com/,desktop,78,92,87,91
-https://example.com/about,mobile,62,95,91,89
-https://example.com/about,desktop,91,95,91,89
-AVERAGE,ALL,69.0,93.5,89.0,90.0
+url,strategy,performance,accessibility,best-practices,seo,lab_FCP_display,lab_FCP_raw,lab_FCP_score,lab_LCP_display,...,field_FCP_p75,field_FCP_category,...,top_opportunity,top_opp_savings_ms
+https://example.com/,mobile,45,92,87,91,2.5 s,2500,45,4.1 s,...,1800,AVERAGE,...,Reduce unused CSS,850
+...
+AVERAGE,Mobile,53.5,93.5,89.0,90.0,...
+AVERAGE,Desktop,84.5,93.5,89.0,90.0,...
+AVERAGE,Overall,69.0,93.5,89.0,90.0,...
 ```
 
 ### Score Colour Coding
@@ -294,6 +381,10 @@ AVERAGE,ALL,69.0,93.5,89.0,90.0
 | ⚫ Dim/Grey | N/A         | Scan failed      |
 
 These thresholds match [Google's official Lighthouse scoring](https://developer.chrome.com/docs/lighthouse/performance/performance-scoring/).
+
+Field data categories use the same colour scheme: **FAST** (green), **AVERAGE** (yellow), **SLOW** (red).
+
+Lab metric scores use extended thresholds: ≥ 90 (green), ≥ 50 (yellow), ≥ 25 (orange), < 25 (red).
 
 ---
 
@@ -316,9 +407,11 @@ These thresholds match [Google's official Lighthouse scoring](https://developer.
 4. Read URLs from CSV via `reader.read_urls()`
 5. Build full URLs from route paths via `reader.build_full_urls()`
 6. Deduplicate URLs
-7. Scan all URLs concurrently via `scanner.scan_urls()`
-8. Aggregate and display via `reporter.*`
-9. Export to CSV
+7. Scan all URLs concurrently via `scanner.scan_urls()` (returns enriched result dicts with scores, lab, field, opportunities, diagnostics)
+8. Build DataFrame via `reporter.build_dataframe()`
+9. Compute strategy averages via `reporter.compute_averages_by_strategy()` (mobile / desktop / overall)
+10. Display 6-section report via `reporter.print_full_report()`
+11. Export flattened CSV with 3 average rows via `reporter.export_csv()`
 
 ---
 
@@ -344,20 +437,34 @@ These thresholds match [Google's official Lighthouse scoring](https://developer.
 
 ### scanner.py
 
-**Role:** Google PageSpeed Insights API interaction with concurrent execution.
+**Role:** Google PageSpeed Insights API interaction with concurrent execution and comprehensive data extraction.
 
-| Function                              | Description                                              |
-|---------------------------------------|----------------------------------------------------------|
-| `_fetch_pagespeed(url, strategy, key)`| Single API request; returns JSON or `None` on failure    |
-| `_extract_scores(data)`              | Extracts 4 category scores (0–100) from API response     |
-| `_scan_single(url, strategy, key)`   | Unit of work for one URL + strategy (submitted to thread pool) |
-| `scan_urls(urls, key, delay, max_workers)` | Dispatches all jobs concurrently and collects results |
+| Function                                   | Description                                                                  |
+|--------------------------------------------|------------------------------------------------------------------------------|
+| `_fetch_pagespeed(url, strategy, key)`     | Single API request; returns full JSON or `None` on failure                   |
+| `_extract_category_scores(data)`           | Extracts 4 category scores (0–100) from API response                         |
+| `_extract_lab_metrics(data)`               | Extracts 6 lab metrics (FCP, LCP, CLS, TBT, SI, TTI) with display/raw/score |
+| `_extract_field_data(data)`                | Extracts CrUX field data (FCP, LCP, CLS, INP, TTFB, FID) with distributions |
+| `_extract_opportunities(data)`             | Extracts top 10 opportunities sorted by estimated savings                    |
+| `_extract_diagnostics(data)`               | Extracts top 5 informational diagnostics                                     |
+| `_scan_single(url, strategy, key)`         | Unit of work for one URL + strategy (submitted to thread pool)               |
+| `scan_urls(urls, key, delay, max_workers)` | Dispatches all jobs concurrently and collects results                         |
 
 **API details:**
 - Endpoint: `https://www.googleapis.com/pagespeedonline/v5/runPagespeed`
 - Strategies: `mobile`, `desktop`
 - Categories: `performance`, `accessibility`, `best-practices`, `seo`
 - Timeout: 120 seconds per request
+
+**Data extracted per scan:**
+
+| Data Type          | Fields                                                        |
+|--------------------|---------------------------------------------------------------|
+| Category scores    | Performance, Accessibility, Best Practices, SEO (0–100)       |
+| Lab metrics        | FCP, LCP, CLS, TBT, Speed Index, TTI (display + raw + score) |
+| Field / CrUX data  | FCP, LCP, CLS, INP, TTFB, FID (p75 + category + distribution)|
+| Opportunities      | Up to 10 per scan, with title + savings_ms                    |
+| Diagnostics        | Up to 5 per scan, with title + display value                  |
 
 **Concurrency model:**
 - Uses `concurrent.futures.ThreadPoolExecutor` with configurable `max_workers`
@@ -370,16 +477,28 @@ These thresholds match [Google's official Lighthouse scoring](https://developer.
 
 ### reporter.py
 
-**Role:** Data aggregation, terminal display, and CSV export.
+**Role:** Comprehensive multi-section report, data aggregation, and CSV export.
 
-| Function                              | Description                                            |
-|---------------------------------------|--------------------------------------------------------|
-| `_score_color(score)`                 | Returns a Rich colour name based on score thresholds   |
-| `_format_score(score)`                | Returns a coloured `rich.Text` object                  |
-| `build_dataframe(results)`            | Converts result dicts to a `pandas.DataFrame`          |
-| `compute_averages(df)`               | Calculates mean score per category (rounded to 1 d.p.) |
-| `print_results_table(df, averages)`   | Prints the colour-coded Rich table to the terminal     |
-| `export_csv(df, averages, path)`      | Writes results + averages row to a CSV file            |
+| Function                                  | Description                                                              |
+|-------------------------------------------|--------------------------------------------------------------------------|
+| `_score_color(score)`                     | Returns a Rich colour name based on Lighthouse score thresholds          |
+| `_format_score(score)`                    | Returns a coloured `rich.Text` object for scores                         |
+| `_field_category_color(category)`         | Returns colour for field data categories (FAST/AVERAGE/SLOW)             |
+| `_format_field_category(category)`        | Returns coloured text for field categories                               |
+| `_format_ms(value)`                       | Formats millisecond values for display                                   |
+| `_lab_score_color(score)`                 | Returns colour for lab scores (extended 4-tier thresholds)               |
+| `build_dataframe(results)`                | Converts result dicts to a `pandas.DataFrame`                            |
+| `compute_averages_by_strategy(df)`        | Computes separate mobile / desktop / overall average scores              |
+| `print_scores_table(df)`                  | **Section 1** — Individual category scores per URL                       |
+| `print_averages_tables(averages)`         | **Section 2** — Mobile / Desktop / Overall average tables with ratings   |
+| `print_lab_metrics_table(df)`             | **Section 3** — Core Web Vitals lab data per URL                         |
+| `print_field_data_table(df)`              | **Section 4** — CrUX real-user metrics with distributions                |
+| `print_recommendations(df)`               | **Section 5** — Aggregated opportunities + diagnostics                   |
+| `print_summary(df, averages)`             | **Section 6** — Auto-generated actionable improvement summary            |
+| `_get_suggestions(category, score)`       | Returns category-specific improvement tips                               |
+| `_add_lab_suggestions(suggestions, df)`   | Adds lab-metric-specific suggestions based on actual values              |
+| `export_csv(df, averages, output_path)`   | Writes flattened CSV with 3 average rows                                 |
+| `print_full_report(df, averages)`         | Master function that calls all 6 sections in sequence                    |
 
 ---
 
@@ -468,10 +587,10 @@ webperformancescanner/
 ├── .gitignore           # Ignores venv, .env, results, __pycache__
 ├── main.py              # CLI entry point & orchestrator
 ├── reader.py            # CSV parsing & URL construction
-├── scanner.py           # PageSpeed API calls (concurrent)
-├── reporter.py          # pandas aggregation, Rich table, CSV export
+├── scanner.py           # PageSpeed API + data extraction (concurrent)
+├── reporter.py          # 6-section report, averages, recommendations, CSV
 ├── urls.csv             # Input: URLs or route paths to scan
-├── results.csv          # Output: scan results (git-ignored)
+├── results.csv          # Output: flattened scan results (git-ignored)
 ├── requirements.txt     # Python dependencies
 ├── README.md            # This documentation
 └── venv/                # Virtual environment (git-ignored)
