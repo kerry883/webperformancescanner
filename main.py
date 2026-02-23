@@ -5,9 +5,8 @@ Ties together the reader, scanner, and reporter modules to run a
 full PageSpeed Insights scan from the command line.
 
 Usage:
-    python main.py                          # uses BASE_URL from .env
-    python main.py --base-url https://example.com
-    python main.py --csv routes.csv --delay 3
+    python main.py --csv urls.csv
+    python main.py --csv routes.csv --base-url https://example.com
 """
 
 import argparse
@@ -25,7 +24,7 @@ from reporter import (
     export_csv,
     print_full_report,
 )
-from scanner import scan_urls
+from scanner import scan_urls, validate_urls
 
 console = Console()
 
@@ -61,8 +60,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--csv",
         type=str,
-        default="urls.csv",
-        help="Path to the CSV file containing routes (default: urls.csv).",
+        required=True,
+        help=(
+            "Path to a CSV file containing URLs or route paths "
+            "to scan in batch."
+        ),
     )
     parser.add_argument(
         "--delay",
@@ -87,6 +89,23 @@ def _parse_args() -> argparse.Namespace:
             "Number of concurrent threads / 'channels' for parallel "
             "API calls (default: 10). Increase for more speed, "
             "decrease if you hit rate-limit errors."
+        ),
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=5.0,
+        help=(
+            "Maximum API requests per second across all workers "
+            "(default: 5). Reduce to avoid 400/429 errors."
+        ),
+    )
+    parser.add_argument(
+        "--no-validate",
+        action="store_true",
+        help=(
+            "Skip URL validation and shortlink resolution. "
+            "Use if you are sure all URLs are valid."
         ),
     )
     return parser.parse_args()
@@ -129,7 +148,7 @@ def main() -> None:
         except ValueError:
             delay = 2.0
 
-    # ── 5. Read URLs / routes from CSV ──────────────────────────────────
+    # ── 5. Read URLs from CSV file ──────────────────────────────────────
     csv_full_urls, routes = read_urls(args.csv)
 
     # Build full URLs from route paths (needs a base domain)
@@ -152,14 +171,30 @@ def main() -> None:
             full_urls.append(url)
 
     if base_url and base_url != "https://example.com":
-        console.print(f"[bold]Base URL:[/bold]  {base_url}")
-    console.print(f"[bold]URLs:[/bold]      {len(full_urls)} unique target(s)")
-    console.print(f"[bold]Workers:[/bold]   {args.workers} concurrent threads")
-    console.print(f"[bold]Output:[/bold]    {args.output}")
+        console.print(f"[bold]Base URL:[/bold]    {base_url}")
+    console.print(f"[bold]CSV file:[/bold]   {args.csv}")
+    console.print(f"[bold]URLs:[/bold]        {len(full_urls)} unique target(s)")
+    console.print(f"[bold]Workers:[/bold]     {args.workers} concurrent threads")
+    console.print(f"[bold]Rate limit:[/bold]  {args.rate_limit:.0f} req/s")
+    console.print(f"[bold]Output:[/bold]      {args.output}")
 
-    # ── 6. Scan URLs via API (concurrent) ───────────────────────────────
+    # ── 6. Validate & sanitise URLs ─────────────────────────────────────
+    if not args.no_validate:
+        full_urls, skipped = validate_urls(full_urls)
+        if not full_urls:
+            console.print(
+                "[bold red]Error:[/bold red] No valid URLs remain "
+                "after validation."
+            )
+            sys.exit(1)
+
+    # ── 7. Scan URLs via API (concurrent + rate-limited + retries) ─────
     results = scan_urls(
-        full_urls, api_key, delay=delay, max_workers=args.workers
+        full_urls,
+        api_key,
+        delay=delay,
+        max_workers=args.workers,
+        rate_limit=args.rate_limit,
     )
 
     if not results:
@@ -169,12 +204,12 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # ── 7. Aggregate & display comprehensive report ──────────────────
+    # ── 8. Aggregate & display comprehensive report ──────────────────
     df = build_dataframe(results)
     averages = compute_averages_by_strategy(df)
     print_full_report(df, averages)
 
-    # ── 8. Export CSV ───────────────────────────────────────────────────
+    # ── 9. Export CSV ───────────────────────────────────────────────────
     export_csv(df, averages, output_path=args.output)
 
     console.print()

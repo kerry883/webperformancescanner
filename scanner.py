@@ -12,11 +12,20 @@ For each URL it runs both 'mobile' and 'desktop' strategies and extracts:
 Uses concurrent.futures.ThreadPoolExecutor so that many API calls run
 in parallel ("each URL on its own channel"), dramatically reducing the
 total wall-clock time from hours to minutes.
+
+Reliability features:
+  • Retry with exponential back-off (3 attempts for 400/429/5xx)
+  • Per-second rate limiter (token-bucket) to avoid API burst throttling
+  • URL validation & sanitisation before sending
+  • Full error-body logging for easier debugging
 """
 
+import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote, urlparse, urlunparse
 
 import requests
 from rich.console import Console
@@ -64,20 +73,214 @@ FIELD_METRIC_KEYS = {
 MAX_OPPORTUNITIES = 10
 MAX_DIAGNOSTICS = 5
 
+# ── Retry & rate-limit configuration ───────────────────────────────────────
+
+MAX_RETRIES = 3            # Total attempts per API call (1 original + 2 retries)
+RETRY_BASE_DELAY = 4.0     # Seconds — doubled each retry (4 → 8 → 16)
+RETRYABLE_STATUS_CODES = {400, 429, 500, 502, 503}
+
+# Default requests per second across all threads (token-bucket)
+DEFAULT_RATE_LIMIT = 5     # 5 req/s is safe for free-tier PSI API
+
+
+# ── Token-bucket rate limiter ───────────────────────────────────────────────
+
+class _RateLimiter:
+    """Thread-safe token-bucket rate limiter."""
+
+    def __init__(self, rate: float):
+        """
+        Args:
+            rate: Maximum requests per second.
+        """
+        self._rate = rate
+        self._lock = threading.Lock()
+        self._tokens = rate
+        self._last_refill = time.monotonic()
+
+    def acquire(self) -> None:
+        """Block until a token is available."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                self._tokens = min(
+                    self._rate, self._tokens + elapsed * self._rate
+                )
+                self._last_refill = now
+
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+
+            # No token — wait a short interval and retry
+            time.sleep(1.0 / self._rate)
+
 # Thread-safe lock for appending results
 _results_lock = threading.Lock()
 
 
-def _fetch_pagespeed(
-    url: str, strategy: str, api_key: str
-) -> Optional[Dict[str, Any]]:
+# ── URL validation & sanitisation ───────────────────────────────────────────
+
+# Domains known to be URL shorteners / redirect services
+_SHORTLINK_DOMAINS = {
+    "bit.ly", "goo.gl", "t.co", "tinyurl.com", "ow.ly",
+    "buff.ly", "is.gd", "v.gd", "rebrand.ly", "cutt.ly",
+    "shorturl.at", "tiny.cc", "lnkd.in",
+}
+
+
+def _is_shortlink(url: str) -> bool:
+    """Return True if the URL belongs to a known shortlink domain."""
+    try:
+        host = urlparse(url).hostname or ""
+        # Also catch sub-domains like "1.envato.market"
+        return (
+            host in _SHORTLINK_DOMAINS
+            or any(host.endswith(f".{d}") for d in _SHORTLINK_DOMAINS)
+        )
+    except Exception:
+        return False
+
+
+def _resolve_redirect(url: str, timeout: int = 10) -> str:
     """
-    Make a single PageSpeed Insights API request.
+    Follow redirects and return the final destination URL.
+
+    Falls back to the original URL on any error.
+    """
+    try:
+        resp = requests.head(
+            url, allow_redirects=True, timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        final = resp.url
+        if final and final != url:
+            console.print(
+                f"  [cyan]↳ Resolved[/cyan] {url} → {final}"
+            )
+        return final
+    except Exception:
+        return url
+
+
+def _sanitise_url(url: str) -> Optional[str]:
+    """
+    Validate and sanitise a URL before sending it to the PSI API.
+
+    Returns the cleaned URL, or None if the URL is invalid.
+    """
+    url = url.strip()
+    if not url:
+        return None
+
+    # Must have a scheme
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return None
+
+    if not parsed.hostname:
+        return None
+
+    # Encode non-ASCII / unsafe chars in the path
+    safe_path = quote(parsed.path, safe="/:@!$&'()*+,;=-._~")
+
+    # Rebuild with encoded path
+    sanitised = urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        safe_path,
+        parsed.params,
+        parsed.query,
+        "",  # drop fragment — API ignores it
+    ))
+
+    return sanitised
+
+
+def validate_urls(
+    urls: List[str],
+    resolve_redirects: bool = True,
+) -> Tuple[List[str], List[Dict[str, str]]]:
+    """
+    Validate and sanitise a list of URLs before scanning.
+
+    Performs:
+      1. Basic format validation (scheme, host)
+      2. Shortlink detection & redirect resolution
+      3. URL encoding / sanitisation
 
     Args:
-        url:      The fully-qualified URL to analyse.
-        strategy: Either 'mobile' or 'desktop'.
-        api_key:  Google API key.
+        urls:              Raw URL list from the CSV.
+        resolve_redirects: Whether to follow shortlink redirects.
+
+    Returns:
+        (valid_urls, skipped) — skipped contains {url, reason} dicts.
+    """
+    valid: List[str] = []
+    skipped: List[Dict[str, str]] = []
+
+    console.print()
+    console.rule("[bold cyan]Validating URLs[/bold cyan]")
+
+    for url in urls:
+        # 1. Basic sanitisation
+        clean = _sanitise_url(url)
+        if clean is None:
+            skipped.append({"url": url, "reason": "Invalid URL format"})
+            console.print(
+                f"  [yellow]⚠ Skipped[/yellow] {url} — invalid format"
+            )
+            continue
+
+        # 2. Shortlink resolution
+        if _is_shortlink(clean) and resolve_redirects:
+            resolved = _resolve_redirect(clean)
+            resolved_clean = _sanitise_url(resolved)
+            if resolved_clean is None:
+                skipped.append({
+                    "url": url,
+                    "reason": f"Redirect resolved to invalid URL: {resolved}",
+                })
+                console.print(
+                    f"  [yellow]⚠ Skipped[/yellow] {url} — "
+                    f"redirect led to invalid URL"
+                )
+                continue
+            clean = resolved_clean
+
+        valid.append(clean)
+
+    if skipped:
+        console.print(
+            f"\n  [yellow]⚠[/yellow] {len(skipped)} URL(s) skipped "
+            f"(see above). {len(valid)} URL(s) will be scanned."
+        )
+    else:
+        console.print(
+            f"  [green]✓[/green] All {len(valid)} URL(s) passed validation."
+        )
+
+    return valid, skipped
+
+
+def _fetch_pagespeed(
+    url: str,
+    strategy: str,
+    api_key: str,
+    rate_limiter: Optional[_RateLimiter] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Make a single PageSpeed Insights API request **with retries**.
+
+    Retries on 400/429/5xx with exponential back-off.  On each
+    failure the full error body is logged for diagnosis.
+
+    Args:
+        url:          The fully-qualified URL to analyse.
+        strategy:     Either 'mobile' or 'desktop'.
+        api_key:      Google API key.
+        rate_limiter: Optional token-bucket rate limiter.
 
     Returns:
         The JSON response dict on success, or None on failure.
@@ -89,32 +292,105 @@ def _fetch_pagespeed(
         "category": CATEGORIES,
     }
 
-    try:
-        response = requests.get(API_ENDPOINT, params=params, timeout=120)
-        response.raise_for_status()
-        return response.json()
+    last_error_msg = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        # Respect rate limit before every request
+        if rate_limiter:
+            rate_limiter.acquire()
 
-    except requests.exceptions.HTTPError as exc:
-        console.print(
-            f"  [red]HTTP Error[/red] for {url} ({strategy}): "
-            f"{exc.response.status_code} — {exc.response.reason}"
-        )
-    except requests.exceptions.ConnectionError:
-        console.print(
-            f"  [red]Connection Error[/red] for {url} ({strategy}): "
-            "Could not reach the API."
-        )
-    except requests.exceptions.Timeout:
-        console.print(
-            f"  [red]Timeout[/red] for {url} ({strategy}): "
-            "The API request timed out."
-        )
-    except requests.exceptions.RequestException as exc:
-        console.print(
-            f"  [red]Request Error[/red] for {url} ({strategy}): {exc}"
-        )
+        try:
+            response = requests.get(API_ENDPOINT, params=params, timeout=120)
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code
+            # Extract the real error message from the API response body
+            error_detail = _extract_api_error(exc.response)
+            last_error_msg = (
+                f"HTTP {status} — {exc.response.reason}"
+                f"{f' | {error_detail}' if error_detail else ''}"
+            )
+
+            if status in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                wait = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                console.print(
+                    f"  [yellow]⟳ Retry {attempt}/{MAX_RETRIES}[/yellow] "
+                    f"for {url} ({strategy}): {last_error_msg} "
+                    f"— waiting {wait:.0f}s"
+                )
+                time.sleep(wait)
+                continue
+
+            # Final attempt failed or non-retryable status
+            console.print(
+                f"  [red]✗ Failed[/red] {url} ({strategy}): {last_error_msg}"
+            )
+
+        except requests.exceptions.ConnectionError:
+            last_error_msg = "Connection error — could not reach the API"
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                console.print(
+                    f"  [yellow]⟳ Retry {attempt}/{MAX_RETRIES}[/yellow] "
+                    f"for {url} ({strategy}): {last_error_msg} "
+                    f"— waiting {wait:.0f}s"
+                )
+                time.sleep(wait)
+                continue
+            console.print(
+                f"  [red]✗ Failed[/red] {url} ({strategy}): {last_error_msg}"
+            )
+
+        except requests.exceptions.Timeout:
+            last_error_msg = "Request timed out (>120s)"
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                console.print(
+                    f"  [yellow]⟳ Retry {attempt}/{MAX_RETRIES}[/yellow] "
+                    f"for {url} ({strategy}): {last_error_msg} "
+                    f"— waiting {wait:.0f}s"
+                )
+                time.sleep(wait)
+                continue
+            console.print(
+                f"  [red]✗ Failed[/red] {url} ({strategy}): {last_error_msg}"
+            )
+
+        except requests.exceptions.RequestException as exc:
+            console.print(
+                f"  [red]✗ Failed[/red] {url} ({strategy}): {exc}"
+            )
+
+        return None
 
     return None
+
+
+def _extract_api_error(response: requests.Response) -> str:
+    """
+    Extract the human-readable error message from a PSI API error
+    response body.  Returns an empty string if parsing fails.
+    """
+    try:
+        body = response.json()
+        error = body.get("error", {})
+        # Google API errors have a "message" field
+        message = error.get("message", "")
+        # Sometimes there are nested "errors" with "reason"
+        reasons = [
+            e.get("reason", "")
+            for e in error.get("errors", [])
+            if e.get("reason")
+        ]
+        parts = [message] + reasons
+        return " | ".join(p for p in parts if p)
+    except Exception:
+        # Fall back to raw text (truncated)
+        try:
+            return response.text[:200]
+        except Exception:
+            return ""
 
 
 # ── Extraction helpers ──────────────────────────────────────────────────────
@@ -303,14 +579,17 @@ def _extract_diagnostics(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _scan_single(
-    url: str, strategy: str, api_key: str
+    url: str,
+    strategy: str,
+    api_key: str,
+    rate_limiter: Optional[_RateLimiter] = None,
 ) -> Dict[str, Any]:
     """
     Scan a single URL + strategy combination and extract full data.
 
     This is the unit of work submitted to the thread pool.
     """
-    data = _fetch_pagespeed(url, strategy, api_key)
+    data = _fetch_pagespeed(url, strategy, api_key, rate_limiter)
 
     if data is None:
         return {
@@ -348,6 +627,7 @@ def scan_urls(
     api_key: str,
     delay: float = 2.0,
     max_workers: int = 10,
+    rate_limit: float = DEFAULT_RATE_LIMIT,
 ) -> List[Dict[str, Any]]:
     """
     Scan a list of URLs with the PageSpeed Insights API **concurrently**.
@@ -356,6 +636,10 @@ def scan_urls(
     All API calls are dispatched across a thread pool so they run in
     parallel — like each URL having its own channel.
 
+    A token-bucket rate limiter ensures no more than *rate_limit*
+    requests are sent per second, regardless of the number of workers.
+    Failed requests are retried with exponential back-off.
+
     Args:
         urls:        List of fully-qualified URLs to scan.
         api_key:     Google API key.
@@ -363,6 +647,7 @@ def scan_urls(
                      concurrent mode — parallelism handles throughput).
         max_workers: Number of concurrent threads / "channels"
                      (default 10).
+        rate_limit:  Maximum API requests per second (default 5).
 
     Returns:
         A list of result dicts with scores, lab metrics, field data,
@@ -371,13 +656,18 @@ def scan_urls(
     results: List[Dict[str, Any]] = []
     total_requests = len(urls) * len(STRATEGIES)
 
+    # Create rate limiter shared across all threads
+    limiter = _RateLimiter(rate_limit)
+
     console.print()
     console.rule("[bold cyan]Scanning URLs (Concurrent)[/bold cyan]")
     console.print(
         f"URLs: [bold]{len(urls)}[/bold]  |  "
         f"Strategies: [bold]{', '.join(STRATEGIES)}[/bold]  |  "
         f"Total API calls: [bold]{total_requests}[/bold]  |  "
-        f"Workers: [bold]{max_workers}[/bold]"
+        f"Workers: [bold]{max_workers}[/bold]  |  "
+        f"Rate limit: [bold]{rate_limit:.0f}[/bold] req/s  |  "
+        f"Max retries: [bold]{MAX_RETRIES}[/bold]"
     )
     console.print()
 
@@ -403,10 +693,9 @@ def scan_urls(
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_job = {
-                executor.submit(_scan_single, url, strategy, api_key): (
-                    url,
-                    strategy,
-                )
+                executor.submit(
+                    _scan_single, url, strategy, api_key, limiter
+                ): (url, strategy)
                 for url, strategy in jobs
             }
 

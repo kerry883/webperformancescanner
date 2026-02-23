@@ -13,11 +13,16 @@ A modular Python CLI tool that batch-scans website URLs using the **Google PageS
 - [Configuration](#configuration)
   - [API Key](#api-key)
   - [Environment Variables](#environment-variables)
-  - [URL Input File](#url-input-file)
+- [URL Input](#url-input)
+  - [CSV File Format](#csv-file-format)
 - [Usage](#usage)
   - [Basic Run](#basic-run)
   - [CLI Arguments](#cli-arguments)
   - [Examples](#examples)
+- [Reliability & Rate Limiting](#reliability--rate-limiting)
+  - [Retry with Exponential Back-off](#retry-with-exponential-back-off)
+  - [Token-Bucket Rate Limiter](#token-bucket-rate-limiter)
+  - [URL Validation & Sanitisation](#url-validation--sanitisation)
 - [Output](#output)
   - [Report Sections](#report-sections)
   - [CSV Export](#csv-export)
@@ -42,8 +47,16 @@ A modular Python CLI tool that batch-scans website URLs using the **Google PageS
 - **Batch scanning** — Analyse hundreds of URLs in a single run.
 - **Concurrent API calls** — Uses a thread pool (`ThreadPoolExecutor`) so every URL gets its own "channel"; scans that previously took ~2 hours now finish in ~10–15 minutes.
 - **Dual strategy** — Every URL is tested for both **mobile** and **desktop**.
-- **Flexible input** — The CSV file accepts full URLs (`https://…`) *or* bare route paths (`/about`) that are combined with a configurable base domain.
+- **CSV-driven batch input** — Specify a CSV file with `--csv` containing the URLs or routes to scan.
+- **Flexible URL format** — CSV may contain full URLs (`https://…`) *or* bare route paths (`/about`) combined with a configurable base domain.
 - **Automatic deduplication** — Duplicate URLs are removed before scanning.
+
+### Reliability
+
+- **Retry with exponential back-off** — Failed API calls (400/429/5xx) are retried up to 3 times with increasing delays (4s → 8s → 16s).
+- **Token-bucket rate limiter** — Caps requests per second across all threads (default: 5 req/s) to prevent API burst throttling.
+- **URL validation & sanitisation** — Pre-scan checks filter out malformed URLs, resolve shortlink redirects, and encode unsafe characters.
+- **Detailed error logging** — Full API error response bodies are parsed and displayed, not just the HTTP status code.
 
 ### Data Extraction
 
@@ -195,11 +208,19 @@ REQUEST_DELAY=2
 | `BASE_URL`      | No*      | `https://example.com`| Base domain prepended to route paths             |
 | `REQUEST_DELAY` | No       | `2`                  | Delay between sequential requests (legacy param) |
 
-> \* `BASE_URL` is only required if your `urls.csv` contains bare route paths (e.g. `/about`). If the CSV has full URLs, it is not needed.
+> \* `BASE_URL` is only required if your URLs include bare route paths (e.g. `/about`). If using full URLs, it is not needed.
 
-### URL Input File
+---
 
-Create a file called `urls.csv` in the project root. It must have a **header row** and one entry per line.
+## URL Input
+
+The scanner reads URLs from a **CSV file** specified with the required `--csv` argument. The file must have a **header row** and one entry per line.
+
+```bash
+python main.py --csv my_routes.csv
+```
+
+### CSV File Format
 
 **Option A — Full URLs (recommended for multi-domain scans):**
 
@@ -239,42 +260,83 @@ Full URLs are used as-is; route paths have the base domain prepended.
 ### Basic Run
 
 ```bash
-python main.py
+python main.py --csv urls.csv
 ```
-
-This uses the `API_KEY` and `BASE_URL` from `.env`, reads from `urls.csv`, runs 10 concurrent workers, and exports to `results.csv`.
 
 ### CLI Arguments
 
-| Argument       | Type   | Default       | Description                                                  |
-|----------------|--------|---------------|--------------------------------------------------------------|
-| `--base-url`   | string | `.env` value  | Base domain to prepend to route paths                        |
-| `--csv`        | string | `urls.csv`    | Path to the input CSV file                                   |
-| `--delay`      | float  | `2.0`         | Legacy delay parameter (kept for compatibility)              |
-| `--output`     | string | `results.csv` | Path for the exported results file                           |
-| `--workers`    | int    | `10`          | Number of concurrent threads ("channels") for parallel scans |
+| Argument         | Type   | Default       | Description                                                          |
+|------------------|--------|---------------|----------------------------------------------------------------------|
+| `--csv`          | string | **(required)**| Path to a CSV file with URLs/routes to scan in batch.                |
+| `--base-url`     | string | `.env` value  | Base domain to prepend to route paths                                |
+| `--delay`        | float  | `2.0`         | Legacy delay parameter (kept for compatibility)                      |
+| `--output`       | string | `results.csv` | Path for the exported results file                                   |
+| `--workers`      | int    | `10`          | Number of concurrent threads ("channels") for parallel scans         |
+| `--rate-limit`   | float  | `5.0`         | Maximum API requests per second across all workers                   |
+| `--no-validate`  | flag   | off           | Skip URL validation and shortlink resolution                         |
 
 ### Examples
 
 ```bash
-# Scan with defaults (10 workers, urls.csv, results.csv)
-python main.py
+# Scan from a CSV file with defaults
+python main.py --csv urls.csv
 
-# Override base URL from the command line
-python main.py --base-url https://mysite.com
-
-# Use a different input file and 20 parallel workers
+# Use a custom CSV and 20 parallel workers
 python main.py --csv my_routes.csv --workers 20
 
 # Export results to a custom file
-python main.py --output report_feb2026.csv
+python main.py --csv urls.csv --output report_feb2026.csv
 
-# Conservative mode (fewer workers to avoid rate limits)
-python main.py --workers 5
+# Conservative mode (fewer workers + lower rate limit)
+python main.py --csv urls.csv --workers 5 --rate-limit 2
+
+# Skip URL validation (if you're sure all URLs are clean)
+python main.py --csv urls.csv --no-validate
 
 # Full example with all options
-python main.py --base-url https://mysite.com --csv routes.csv --workers 15 --output scan.csv
+python main.py --csv routes.csv --base-url https://mysite.com --workers 15 --rate-limit 4 --output scan.csv
 ```
+
+---
+
+## Reliability & Rate Limiting
+
+### Retry with Exponential Back-off
+
+Every API call is retried up to **3 times** on failure. Retryable HTTP status codes: `400`, `429`, `500`, `502`, `503`.
+
+| Attempt | Delay before retry |
+|---------|-------------------|
+| 1st     | 4 seconds          |
+| 2nd     | 8 seconds          |
+| 3rd     | Final failure      |
+
+The actual Google API error message is extracted from the response body and displayed:
+
+```
+⟳ Retry 1/3 for https://example.com/checkout (mobile):
+  HTTP 400 — Bad Request | LIGHTHOUSE_ERROR | ERRORED_DOCUMENT_REQUEST — waiting 4s
+```
+
+### Token-Bucket Rate Limiter
+
+A shared rate limiter ensures no more than `--rate-limit` requests per second are sent across all worker threads. This prevents burst-triggered `400` errors that occur when too many requests hit the API simultaneously.
+
+| Rate limit | Behaviour                                           |
+|------------|-----------------------------------------------------|
+| `5` (default) | Good balance of speed and reliability             |
+| `2–3`      | Conservative — use if you still see 400 errors       |
+| `8–10`     | Aggressive — may trigger throttling on free tier     |
+
+### URL Validation & Sanitisation
+
+Before scanning, all URLs pass through a validation pipeline (disable with `--no-validate`):
+
+1. **Format check** — Ensures valid scheme (`http`/`https`) and hostname.
+2. **Shortlink detection** — URLs from `bit.ly`, `goo.gl`, `t.co`, etc. are automatically resolved to their final destination via HTTP redirect.
+3. **Character encoding** — Non-ASCII and unsafe characters in URL paths are percent-encoded.
+4. **Fragment stripping** — URL fragments (`#section`) are removed (API ignores them).
+5. **Invalid URL skipping** — Malformed URLs are skipped with a warning instead of wasting API calls.
 
 ---
 
@@ -397,7 +459,7 @@ Lab metric scores use extended thresholds: ≥ 90 (green), ≥ 50 (yellow), ≥ 
 | Function        | Description                                        |
 |-----------------|----------------------------------------------------|
 | `_load_env()`   | Loads variables from `.env` via `python-dotenv`    |
-| `_parse_args()` | Parses CLI arguments with `argparse`               |
+| `_parse_args()` | Parses CLI arguments with `argparse` (`--csv` is required) |
 | `main()`        | Orchestrates the full pipeline: read → scan → report |
 
 **Pipeline steps:**
@@ -437,24 +499,32 @@ Lab metric scores use extended thresholds: ≥ 90 (green), ≥ 50 (yellow), ≥ 
 
 ### scanner.py
 
-**Role:** Google PageSpeed Insights API interaction with concurrent execution and comprehensive data extraction.
+**Role:** Google PageSpeed Insights API interaction with concurrent execution, retry logic, rate limiting, URL validation, and comprehensive data extraction.
 
-| Function                                   | Description                                                                  |
-|--------------------------------------------|------------------------------------------------------------------------------|
-| `_fetch_pagespeed(url, strategy, key)`     | Single API request; returns full JSON or `None` on failure                   |
-| `_extract_category_scores(data)`           | Extracts 4 category scores (0–100) from API response                         |
-| `_extract_lab_metrics(data)`               | Extracts 6 lab metrics (FCP, LCP, CLS, TBT, SI, TTI) with display/raw/score |
-| `_extract_field_data(data)`                | Extracts CrUX field data (FCP, LCP, CLS, INP, TTFB, FID) with distributions |
-| `_extract_opportunities(data)`             | Extracts top 10 opportunities sorted by estimated savings                    |
-| `_extract_diagnostics(data)`               | Extracts top 5 informational diagnostics                                     |
-| `_scan_single(url, strategy, key)`         | Unit of work for one URL + strategy (submitted to thread pool)               |
-| `scan_urls(urls, key, delay, max_workers)` | Dispatches all jobs concurrently and collects results                         |
+| Function                                          | Description                                                                  |
+|---------------------------------------------------|------------------------------------------------------------------------------|
+| `_RateLimiter(rate)`                              | Thread-safe token-bucket rate limiter class                                  |
+| `_is_shortlink(url)`                              | Detects URLs from known shortlink domains (bit.ly, goo.gl, etc.)             |
+| `_resolve_redirect(url)`                          | Follows HTTP redirects to find the final destination URL                     |
+| `_sanitise_url(url)`                              | Validates and encodes a URL; returns `None` if invalid                       |
+| `validate_urls(urls, resolve_redirects)`           | Pre-scan pipeline: validate, resolve shortlinks, sanitise; returns (valid, skipped) |
+| `_fetch_pagespeed(url, strategy, key, limiter)`   | Single API request with retry + exponential back-off                         |
+| `_extract_api_error(response)`                    | Parses the API error response body for human-readable messages               |
+| `_extract_category_scores(data)`                  | Extracts 4 category scores (0–100) from API response                         |
+| `_extract_lab_metrics(data)`                      | Extracts 6 lab metrics (FCP, LCP, CLS, TBT, SI, TTI) with display/raw/score |
+| `_extract_field_data(data)`                       | Extracts CrUX field data (FCP, LCP, CLS, INP, TTFB, FID) with distributions |
+| `_extract_opportunities(data)`                    | Extracts top 10 opportunities sorted by estimated savings                    |
+| `_extract_diagnostics(data)`                      | Extracts top 5 informational diagnostics                                     |
+| `_scan_single(url, strategy, key, limiter)`       | Unit of work for one URL + strategy (submitted to thread pool)               |
+| `scan_urls(urls, key, delay, max_workers, rate_limit)` | Dispatches all jobs concurrently with rate limiting                      |
 
 **API details:**
 - Endpoint: `https://www.googleapis.com/pagespeedonline/v5/runPagespeed`
 - Strategies: `mobile`, `desktop`
 - Categories: `performance`, `accessibility`, `best-practices`, `seo`
 - Timeout: 120 seconds per request
+- Retries: 3 attempts with exponential back-off (4s → 8s → 16s)
+- Retryable status codes: 400, 429, 500, 502, 503
 
 **Data extracted per scan:**
 
@@ -469,6 +539,7 @@ Lab metric scores use extended thresholds: ≥ 90 (green), ≥ 50 (yellow), ≥ 
 **Concurrency model:**
 - Uses `concurrent.futures.ThreadPoolExecutor` with configurable `max_workers`
 - All URL × strategy pairs are submitted simultaneously
+- Token-bucket rate limiter is shared across all threads
 - Results are collected via `as_completed()` for real-time progress updates
 - Thread-safe result collection via `threading.Lock`
 - Results are sorted back into original URL order after collection
@@ -516,20 +587,22 @@ The scanner uses a **thread pool** to run API calls in parallel, dramatically re
 
 1. Each URL × strategy pair becomes a "job".
 2. Jobs are submitted to a `ThreadPoolExecutor` with `max_workers` threads.
-3. Up to `max_workers` API calls run simultaneously — each on its own "channel".
-4. As each job completes, the progress bar updates in real time.
-5. Once all jobs finish, results are sorted and passed to the reporter.
+3. A shared **token-bucket rate limiter** ensures no more than `--rate-limit` requests/second.
+4. Up to `max_workers` API calls run simultaneously — each on its own “channel”.
+5. Failed calls are **retried** up to 3 times with exponential back-off.
+6. As each job completes, the progress bar updates in real time.
+7. Once all jobs finish, results are sorted and passed to the reporter.
 
-**Tuning `--workers`:**
+**Tuning `--workers` and `--rate-limit`:**
 
-| Workers | Trade-off                                                    |
-|---------|--------------------------------------------------------------|
-| `5`     | Conservative — unlikely to hit rate limits, slower overall   |
-| `10`    | Default — good balance of speed and API courtesy             |
-| `15–20` | Aggressive — faster, but may trigger `429 Too Many Requests` |
-| `25+`   | Not recommended unless you have a high API quota             |
+| Workers | Rate Limit | Trade-off                                                    |
+|---------|------------|--------------------------------------------------------------|
+| `5`     | `2`        | Very conservative — near-zero failures, slower overall       |
+| `10`    | `5`        | Default — good balance of speed and API courtesy              |
+| `15`    | `5`        | Faster, relying on rate limiter to smooth bursts              |
+| `20`    | `8`        | Aggressive — may trigger throttling on free-tier API keys    |
 
-> **Tip:** If you see `HTTP Error 429` in the output, reduce workers: `--workers 5`
+> **Tip:** If you see `HTTP 400` or `HTTP 429` in the output, reduce rate limit: `--rate-limit 2 --workers 5`
 
 ---
 
@@ -537,16 +610,21 @@ The scanner uses a **thread pool** to run API calls in parallel, dramatically re
 
 The tool handles errors gracefully at every stage:
 
-| Error                      | Behaviour                                                  |
-|----------------------------|------------------------------------------------------------|
-| Missing `.env` / API key   | Prints clear message, exits with code 1                    |
-| Missing `urls.csv`         | Prints file-not-found message, exits with code 1           |
-| Empty CSV / no valid rows  | Prints "no entries found" message, exits with code 1       |
-| HTTP 4xx / 5xx from API    | Logs the error, records `N/A` scores, continues scanning   |
-| Connection error           | Logs the error, records `N/A` scores, continues scanning   |
-| Request timeout (>120s)    | Logs the error, records `N/A` scores, continues scanning   |
-| Malformed API response     | Missing categories are recorded as `None` / `N/A`         |
-| Unexpected thread exception| Caught, logged, recorded as `N/A`, scan continues          |
+| Error                      | Behaviour                                                        |
+|----------------------------|------------------------------------------------------------------|
+| Missing `.env` / API key   | Prints clear message, exits with code 1                          |
+| Missing CSV file           | Prints file-not-found message, exits with code 1                 |
+| No URLs in CSV             | Prints "no entries found" message, exits with code 1              |
+| Empty CSV / no valid rows  | Prints "no entries found" message, exits with code 1             |
+| Invalid / malformed URL    | Skipped during validation with a warning                         |
+| Shortlink URL              | Automatically resolved via redirect before scanning              |
+| HTTP 400 from API          | Retried up to 3 times; full error body logged                    |
+| HTTP 429 (rate limit)      | Retried with exponential back-off (4s → 8s)                     |
+| HTTP 5xx (server error)    | Retried up to 3 times; records `N/A` scores if all fail          |
+| Connection error           | Retried; logs the error, records `N/A` scores                    |
+| Request timeout (>120s)    | Retried; logs the error, records `N/A` scores                    |
+| Malformed API response     | Missing categories are recorded as `None` / `N/A`               |
+| Unexpected thread exception| Caught, logged, recorded as `N/A`, scan continues                |
 
 The scanner **never crashes mid-run** — failed URLs are recorded with `N/A` scores so you can identify and re-scan them.
 
@@ -558,16 +636,22 @@ The scanner **never crashes mid-run** — failed URLs are recorded with `N/A` sc
 Ensure your `.env` file exists in the project root and contains `API_KEY=your_actual_key` (not the placeholder).
 
 ### "CSV file not found"
-The default input path is `urls.csv` in the current working directory. Use `--csv path/to/file.csv` to specify a different location.
+Use `--csv path/to/file.csv` to specify the correct path to your CSV file.
 
 ### HTTP 429 — Too Many Requests
-The Google API has rate limits. Reduce the number of concurrent workers:
+The Google API has rate limits. Reduce both workers and rate limit:
 ```bash
-python main.py --workers 5
+python main.py --csv urls.csv --workers 5 --rate-limit 2
 ```
 
 ### HTTP 400 — Bad Request
-Usually means a URL is malformed. Check your `urls.csv` for typos or invalid URLs.
+Common causes:
+- **Burst throttling** — too many simultaneous requests. Reduce `--rate-limit`.
+- **Malformed URL** — check your input for typos or special characters.
+- **Auth-required page** — Lighthouse can’t scan pages behind a login wall.
+- **Shortlink** — use `validate_urls` (enabled by default) to auto-resolve redirects.
+
+The tool now shows the **actual API error message** (e.g., `LIGHTHOUSE_ERROR`) instead of just “400 — Bad Request”.
 
 ### All scores show N/A
 - Verify your API key is valid and has the PageSpeed Insights API enabled.
@@ -589,7 +673,7 @@ webperformancescanner/
 ├── reader.py            # CSV parsing & URL construction
 ├── scanner.py           # PageSpeed API + data extraction (concurrent)
 ├── reporter.py          # 6-section report, averages, recommendations, CSV
-├── urls.csv             # Input: URLs or route paths to scan
+├── urls.csv             # Example input: URLs or route paths (optional)
 ├── results.csv          # Output: flattened scan results (git-ignored)
 ├── requirements.txt     # Python dependencies
 ├── README.md            # This documentation
